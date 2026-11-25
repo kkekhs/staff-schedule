@@ -153,6 +153,7 @@
   <!-- ======================================================================= -->
   <!-- MAIN CONTAINER                                                          -->
   <!-- ======================================================================= -->
+  <div class="mx-auto w-full max-w-7xl px-4 pt-3 text-xs font-semibold text-blue-800" role="status" id="syncStatus">공유 일정 연결 중…</div>
   <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
 
     <!-- ===================================================================== -->
@@ -415,6 +416,7 @@
     <!-- TAB 2: ✍️ 일정 입력 · 수정                                             -->
     <!-- ===================================================================== -->
     <section id="tab-input" class="tab-panel hidden space-y-5">
+      <div id="legacyPanel" hidden><label>이 기기의 이전 응답 <select id="legacyList"></select></label> <button type="button" onclick="loadLegacy()">입력란에 불러오기</button></div>
 
       <!-- Edit Mode Status Banner (Hidden unless editing an existing member) -->
       <div id="editModeBanner" class="hidden bg-blue-50 border border-blue-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -545,7 +547,7 @@
         <!-- Form Action Buttons -->
         <div class="pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <p class="text-xs text-slate-500">
-            저장 후 생성되는 <strong>카톡 응답 코드</strong>를 단톡방에 보내면 팀장이 한 번에 취합할 수 있습니다.
+            저장하면 이름·선택 시간·메모가 이 링크를 연 모두에게 보입니다. 수정은 작성한 브라우저 또는 팀장 기기에서 가능합니다.
           </p>
           <div class="flex flex-wrap items-center gap-2">
             <button
@@ -577,7 +579,7 @@
               📤 카톡으로 보낼 개인 응답 코드가 생성되었습니다
             </h3>
             <p class="text-xs text-emerald-800 mt-0.5">
-              각자 휴대폰에서 입력한 경우, 아래 코드를 복사해 팀장에게 카톡으로 보내주세요.
+              공유 일정표에 반영되었습니다. 아래 코드는 응답을 따로 보관할 때 사용할 수 있습니다.
             </p>
           </div>
           <button
@@ -601,6 +603,7 @@
     <!-- TAB 3: ⚙️ 일정 관리                                                    -->
     <!-- ===================================================================== -->
     <section id="tab-manage" class="tab-panel hidden space-y-6">
+      <details class="text-xs text-slate-500"><summary>이 기기의 관리 권한 등록용 식별자</summary><code id="deviceFingerprint"></code></details>
 
       <!-- 1. KakaoTalk Response Code Bulk Import -->
       <div class="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 space-y-4">
@@ -951,7 +954,19 @@
       };
     }
 
-    let state = loadState();
+    const API = 'https://staff-schedule.kkekhs0519.workers.dev/schedule';
+    const base = createDefaultState();
+    const initialConfig = {dates:base.dates,timeSlots:base.timeSlots,activityType:'회의',isSampleMode:false};
+    let state = {...structuredClone(initialConfig), members:[]};
+    let snapshot = null, savedView = null, saving = false, reading = false, editOriginal = null;
+    let deviceKey = '';
+    let legacy = [];
+    try {
+      deviceKey = localStorage.getItem('staff-device-v1') || crypto.randomUUID();
+      localStorage.setItem('staff-device-v1', deviceKey);
+      const prior = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      legacy = (prior.members || []).filter(m => m && typeof m.name==='string' && Array.isArray(m.slots) && !base.members.some(b=>JSON.stringify(b)===JSON.stringify(m)));
+    } catch { /* The shared schedule can still be viewed. */ }
     let activeTab = 'dashboard';
     let dashboardWeekFilter = '전체';
     let inputWeekFilter = '전체';
@@ -965,28 +980,66 @@
     let dragPaintValue = true;
     let pendingConfirmAction = null;
 
-    function loadState() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return createDefaultState();
-        const parsed = JSON.parse(raw);
-        if (!parsed || !Array.isArray(parsed.dates) || !Array.isArray(parsed.timeSlots) || !Array.isArray(parsed.members)) {
-          return createDefaultState();
-        }
-        if (!parsed.activityType) parsed.activityType = '회의';
-        return parsed;
-      } catch (e) {
-        console.error('State load error:', e);
-        return createDefaultState();
+    function syncStatus(message) { document.getElementById('syncStatus').textContent = message; }
+    function applyView(view) {
+      savedView = view;
+      state = {...structuredClone(view.config || initialConfig), members:structuredClone(view.members)};
+      snapshot = structuredClone(state);
+      syncStatus('공유 일정 · 응답 ' + state.members.length + '명');
+      document.getElementById('deviceFingerprint').textContent = view.fingerprint;
+      renderAll();
+      updatePermissions();
+    }
+    function updatePermissions() {
+      const admin = !!savedView?.admin;
+      document.querySelectorAll('[onclick^="confirmClearSampleData"],[onclick^="confirmRestoreSampleData"],[onclick^="addNew"],[onclick^="removeDateById"],[onclick^="removeSlotById"],[onchange^="toggleMemberEssential"],[onchange^="handleJsonRestore"]').forEach(el=>el.disabled=!admin);
+      document.querySelectorAll('[onclick^="openMemberForEdit"],[onclick^="confirmDeleteMember"]').forEach(el=>{
+        const id = el.getAttribute('onclick').match(/'([\w-]+)'/)?.[1];
+        el.disabled = !savedView?.editable.includes(id);
+      });
+    }
+    async function requestView(patch) {
+      const options = {cache:'no-store',headers:{'X-Device-Key':deviceKey},signal:AbortSignal.timeout(18000)};
+      if(patch) { options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(patch); }
+      for(let i=0;i<5;i++){
+        const response = await fetch(API, options);
+        const view = await response.json();
+        if(response.ok) return view;
+        if(view.retry && i<4) continue;
+        throw new Error(view.error || '서버가 바쁩니다. 다시 저장해 주세요.');
       }
     }
-
-    function saveState() {
+    async function refreshShared() {
+      if(saving || reading) return;
+      reading = true;
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      } catch (e) {
-        console.error('State save error:', e);
+        const view = await requestView();
+        if(!saving && (!savedView || view.rev > savedView.rev || view.admin!==savedView.admin)) applyView(view);
+        else if(!saving) syncStatus('공유 일정 · 응답 ' + state.members.length + '명');
+      } catch { if(!saving) syncStatus('서버 연결 실패 · 잠시 후 다시 연결합니다.'); }
+      finally { reading=false; }
+    }
+    async function saveState() {
+      if(!snapshot || saving || !deviceKey) {
+        if(snapshot) state=structuredClone(snapshot);
+        showToast('공유 연결과 브라우저 저장 권한을 확인한 뒤 다시 시도해 주세요.','error');return false;
       }
+      const before = new Map(snapshot.members.map(m=>[m.id,m]));
+      const after = new Map(state.members.map(m=>[m.id,m]));
+      const changes=[];
+      for(const id of new Set([...before.keys(),...after.keys()])) {
+        const old=before.get(id) || null, next=after.get(id) || null;
+        if(JSON.stringify(old)!==JSON.stringify(next)) changes.push({id,before:old,after:next});
+      }
+      const configOf = ({dates,timeSlots,activityType,isSampleMode})=>({dates,timeSlots,activityType,isSampleMode});
+      const configChanged=JSON.stringify(configOf(state))!==JSON.stringify(configOf(snapshot));
+      const patch={changes,config:configChanged?{before:savedView.config,after:configOf(state)}:null};
+      saving=true;
+      const main=document.querySelector('main'), header=document.querySelector('header');
+      main.inert=true;header.inert=true;syncStatus('공유 저장 중…');
+      try { const view=await requestView(patch);applyView(view);return true; }
+      catch(err) {state=structuredClone(snapshot);renderAll();updatePermissions();syncStatus('저장 확인 실패 · 입력 내용을 확인해 주세요.');showToast(err.message || '공유 저장 실패','error');return false;}
+      finally {saving=false;main.inert=false;header.inert=false;}
     }
 
     // =========================================================================
@@ -1129,13 +1182,13 @@
         actionText: '비우고 실전 시작',
         color: 'rose',
         icon: '🧹',
-        onConfirm: () => {
+        onConfirm: async () => {
           state.members = [];
           state.isSampleMode = false;
           pinnedNoticeKey = null;
           editingMemberId = null;
           inputSelectedSet.clear();
-          saveState();
+          if (!await saveState()) return;
           renderAll();
           showToast('응답이 모두 비워졌습니다. 이제 스태프 팀 실전 일정을 취합해 보세요!', 'info');
         }
@@ -1149,13 +1202,13 @@
         actionText: '샘플 복원',
         color: 'blue',
         icon: '🔄',
-        onConfirm: () => {
+        onConfirm: async () => {
           state = createDefaultState();
           pinnedNoticeKey = null;
           editingMemberId = null;
           selectedInspectorKey = null;
           inputSelectedSet.clear();
-          saveState();
+          if (!await saveState()) return;
           renderAll();
           showToast('기본 샘플 데이터가 복원되었습니다.', 'success');
         }
@@ -1266,9 +1319,10 @@
       renderDashboard();
     }
 
-    function setActivityType(type) {
+    async function setActivityType(type) {
+      if (!savedView?.admin) { state.activityType = type; renderDashboard(); state.activityType = snapshot?.activityType || '회의'; return; }
       state.activityType = type;
-      saveState();
+      if (!await saveState()) return;
       renderDashboard();
     }
 
@@ -1463,11 +1517,11 @@
       }).join('');
     }
 
-    function toggleMemberEssential(memberId) {
+    async function toggleMemberEssential(memberId) {
       const m = state.members.find(x => x.id === memberId);
       if (!m) return;
       m.required = !m.required;
-      saveState();
+      if (!await saveState()) return;
       renderDashboard();
       showToast(`${m.name} 부원을 ${m.required ? '★ 필수 인원으로 지정' : '필수 인원에서 해제'}했습니다.`, 'info');
     }
@@ -1481,12 +1535,12 @@
         actionText: '삭제',
         color: 'rose',
         icon: '🗑️',
-        onConfirm: () => {
+        onConfirm: async () => {
           state.members = state.members.filter(x => x.id !== memberId);
           if (editingMemberId === memberId) {
             editingMemberId = null;
           }
-          saveState();
+          if (!await saveState()) return;
           renderAll();
           showToast(`${m.name} 부원의 일정이 삭제되었습니다.`, 'info');
         }
@@ -1874,7 +1928,7 @@
       let surveyMsg = `📋 [3학년 행사 스태프 팀 회의 및 활동 일정 조사]\n\n`;
       surveyMsg += `12/21(월) 축제 전까지 회의·준비 작업·리허설 가능 시간을 한 번에 모으고 있습니다!\n`;
       surveyMsg += `현재까지 응답 완료한 부원 (${totalResp}명): ${submittedNames || '아직 없음'}\n\n`;
-      surveyMsg += `아직 일정을 보내지 않은 부원들은 가능한 시간대를 체크한 뒤 생성된 [내 응답 코드]를 복사해서 단톡방에 올려주세요 🙏 (수정 시에도 다시 보내주시면 자동 반영됩니다!)`;
+      surveyMsg += `가능한 시간대를 체크하고 [일정 저장하기]를 눌러 주세요. 저장하면 모두의 일정표에 반영됩니다.`;
       surveyBox.value = surveyMsg;
     }
 
@@ -1900,6 +1954,8 @@
     function openMemberForEdit(memberId) {
       const m = state.members.find(x => x.id === memberId);
       if (!m) return;
+      if(!savedView?.editable.includes(m.id)){showToast('작성한 기기 또는 팀장만 수정할 수 있습니다.','info');return;}
+      editOriginal=JSON.stringify(m);
       editingMemberId = m.id;
       inputSelectedSet = new Set(Array.isArray(m.slots) ? m.slots : []);
       document.getElementById('inputMemberName').value = m.name;
@@ -1944,7 +2000,7 @@
       const match = state.members.find(m => m.name === typed);
       if (match) {
         document.getElementById('duplicateNameText').textContent =
-          `이미 등록된 '${match.name}' 부원이 있습니다. 그대로 저장하면 기존 일정이 덮어쓰기됩니다.`;
+          `이미 등록된 '${match.name}' 부원이 있습니다. 작성한 기기 또는 팀장만 수정할 수 있습니다.`;
         notice.classList.remove('hidden');
       } else {
         notice.classList.add('hidden');
@@ -2200,7 +2256,7 @@
       renderInputTab();
     }
 
-    function submitMemberSchedule() {
+    async function submitMemberSchedule() {
       const name = document.getElementById('inputMemberName').value.trim();
       const memo = document.getElementById('inputMemberMemo').value.trim();
 
@@ -2216,6 +2272,7 @@
       const cleanSlots = Array.from(inputSelectedSet).filter(k => validKeySet.has(k));
 
       // Check existing by editingMemberId first, otherwise by exact name match
+      if(editingMemberId && !state.members.some(m=>m.id===editingMemberId)){showToast('이미 삭제된 응답입니다. 새 응답을 등록해 주세요.','error');return;}
       let existingIdx = -1;
       if (editingMemberId) {
         existingIdx = state.members.findIndex(m => m.id === editingMemberId);
@@ -2223,6 +2280,9 @@
         existingIdx = state.members.findIndex(m => m.name === name);
       }
 
+      if(existingIdx>=0 && (!savedView?.editable.includes(state.members[existingIdx].id) || (editingMemberId && JSON.stringify(state.members[existingIdx])!==editOriginal))) {
+        showToast('다른 사람이 등록했거나 변경한 응답입니다. 최신 내용을 확인해 주세요.','error');return;
+      }
       let savedMember;
       if (existingIdx >= 0) {
         const prev = state.members[existingIdx];
@@ -2234,7 +2294,7 @@
           slots: cleanSlots
         };
         state.members[existingIdx] = savedMember;
-        showToast(`${name} 부원의 일정이 수정되어 저장되었습니다!`, 'success');
+
       } else {
         savedMember = {
           id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
@@ -2244,12 +2304,13 @@
           slots: cleanSlots
         };
         state.members.push(savedMember);
-        showToast(`${name} 부원의 일정이 새로 등록되었습니다!`, 'success');
+
       }
 
-      editingMemberId = null;
+      if (!await saveState()) return;
+      editingMemberId = null; editOriginal=null;
       document.getElementById('duplicateNameNotice').classList.add('hidden');
-      saveState();
+      showToast(name+' 부원의 일정이 모두에게 공유되었습니다.','success');
 
       // Generate shareable KakaoTalk code
       const code = encodeStaffCode(savedMember);
@@ -2332,7 +2393,7 @@
       copyToClipboard(code, '응답 코드가 복사되었습니다! 단톡방에 붙여넣어 보내세요.');
     }
 
-    function importStaffCodesFrom(textareaId, shouldCloseModal = false) {
+    async function importStaffCodesFrom(textareaId, shouldCloseModal = false) {
       const el = document.getElementById(textareaId);
       const raw = el.value.trim();
       if (!raw) {
@@ -2377,9 +2438,9 @@
       });
 
       if (added + updated > 0) {
+        if (!await saveState()) return;
         el.value = '';
         if (shouldCloseModal) closeCodeImportModal();
-        saveState();
         renderAll();
         showToast(`응답 취합 완료! (신규 ${added}명, 기존 수정 ${updated}명)`, 'success');
       } else {
@@ -2435,7 +2496,7 @@
       `).join('');
     }
 
-    function addNewDate() {
+    async function addNewDate() {
       const input = document.getElementById('newDateLabelInput');
       const week = document.getElementById('newDateWeekSelect').value;
       const label = input.value.trim();
@@ -2455,24 +2516,24 @@
         week
       });
       input.value = '';
-      saveState();
+      if (!await saveState()) return;
       renderAll();
       showToast(`'${label}' 날짜가 ${getWeekDisplayLabel(week)}에 추가되었습니다.`, 'success');
     }
 
-    function removeDateById(dateId) {
+    async function removeDateById(dateId) {
       if (state.dates.length <= 1) {
         showToast('최소 1개 이상의 날짜가 필요합니다.', 'warning');
         return;
       }
       const target = state.dates.find(d => d.id === dateId);
       state.dates = state.dates.filter(d => d.id !== dateId);
-      saveState();
+      if (!await saveState()) return;
       renderAll();
       if (target) showToast(`'${target.label}' 날짜가 삭제되었습니다.`, 'info');
     }
 
-    function addNewTimeSlot() {
+    async function addNewTimeSlot() {
       const input = document.getElementById('newSlotLabelInput');
       const label = input.value.trim();
       if (!label) {
@@ -2484,19 +2545,19 @@
         label
       });
       input.value = '';
-      saveState();
+      if (!await saveState()) return;
       renderAll();
       showToast(`'${label}' 시간대가 추가되었습니다.`, 'success');
     }
 
-    function removeSlotById(slotId) {
+    async function removeSlotById(slotId) {
       if (state.timeSlots.length <= 1) {
         showToast('최소 1개 이상의 시간대가 필요합니다.', 'warning');
         return;
       }
       const target = state.timeSlots.find(s => s.id === slotId);
       state.timeSlots = state.timeSlots.filter(s => s.id !== slotId);
-      saveState();
+      if (!await saveState()) return;
       renderAll();
       if (target) showToast(`'${target.label}' 시간대가 삭제되었습니다.`, 'info');
     }
@@ -2518,7 +2579,7 @@
       const file = event.target.files?.[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = (e) => {
+      reader.onload = async (e) => {
         try {
           const parsed = JSON.parse(e.target.result);
           if (!parsed || !Array.isArray(parsed.dates) || !Array.isArray(parsed.timeSlots) || !Array.isArray(parsed.members)) {
@@ -2528,7 +2589,7 @@
           pinnedNoticeKey = null;
           editingMemberId = null;
           selectedInspectorKey = null;
-          saveState();
+          if (!await saveState()) return;
           renderAll();
           showToast('JSON 백업 데이터를 성공적으로 복원했습니다!', 'success');
         } catch (err) {
@@ -2549,8 +2610,21 @@
       renderManageTab();
     }
 
+    function loadLegacy(){
+      const m=legacy[Number(document.getElementById('legacyList').value)];
+      if(!m)return;
+      cancelEditMode(false);
+      document.getElementById('inputMemberName').value=m.name;
+      document.getElementById('inputMemberMemo').value=m.memo || '';
+      inputSelectedSet=new Set(m.slots);renderInputTab();showToast('이전 응답을 불러왔습니다. 확인 후 저장해 주세요.','info');
+    }
     window.addEventListener('DOMContentLoaded', () => {
-      renderAll();
+      const list=document.getElementById('legacyList');
+      legacy.forEach((m,i)=>list.add(new Option(m.name,String(i))));
+      document.getElementById('legacyPanel').hidden=!legacy.length;
+      renderAll();updatePermissions();refreshShared();
+      setInterval(()=>{if(!document.hidden)refreshShared();},10000);
+      window.addEventListener('focus',refreshShared);
     });
   </script>
 </body>
